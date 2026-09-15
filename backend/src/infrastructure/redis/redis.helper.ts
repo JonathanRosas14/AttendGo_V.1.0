@@ -7,4 +7,3 @@ export const redisClient = new Redis({
   maxRetriesPerRequest: 3,
   lazyConnect: true,
 });
-

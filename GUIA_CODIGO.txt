@@ -1,0 +1,1206 @@
+================================================================================
+                        ATTENDGO - GUIA COMPLETA DEL CODIGO
+                   Explicacion de cada archivo linea por linea
+                    Para desarrolladores junior - Nivel basico
+================================================================================
+
+
+TABLA DE CONTENIDOS
+--------------------
+  1. Que es este proyecto
+  2. Como funciona el proyecto (diagrama)
+  3. app.ts - Punto de entrada
+  4. env.config.ts - Variables de entorno
+  5. postgres.helper.ts - Conexion a PostgreSQL
+  6. redis.helper.ts - Cliente Redis
+  7. logger.ts - Sistema de logs
+  8. auth.enums.ts - Enumeraciones
+  9. Capa de Dominio - Entidades y Value Objects
+  10. docker-compose.yml - Infraestructura Docker
+  11. Migraciones SQL - Base de datos
+  12. Errores comunes y soluciones
+
+
+================================================================================
+1. QUE ES ESTE PROYECTO
+================================================================================
+
+AttendGo es un sistema de control de asistencia para instituciones educativas.
+
+Imagina una universidad donde:
+- El profesor abre una "sesion de asistencia" en su celular
+- Se genera un codigo QR que se proyecta en el salon
+- Los estudiantes escanean el QR con su celular
+- El sistema registra automaticamente quien asistio y quien no
+- Detecta si alguien esta tratando de suplantar a otro estudiante
+
+El proyecto tiene 4 tipos de usuario:
+  - admin_general:         Super administrador (ve todo el sistema)
+  - admin_education_entity: Administrador de una institucion (ej: un director)
+  - professor:             Profesor que toma asistencia
+  - student:               Estudiante que marca asistencia
+
+
+================================================================================
+2. COMO FUNCIONA EL PROYECTO (DIAGRAMA)
+================================================================================
+
+Cuando un usuario abre su navegador y entra a la app:
+
+  NAVEGADOR (Frontend)
+       |
+       | HTTP Request (GET, POST, PUT, DELETE)
+       v
+  +------------------+
+  |   app.ts         |  <-- Punto de entrada (el "cerebro")
+  |   (Fastify)      |
+  +------------------+
+       |
+       |  Las peticiones pasan por capas:
+       |
+       v
+  +------------------+
+  | interfaces/      |  <-- Capa 1: Recibe la peticion HTTP
+  |   routes/        |      Define que URL ejecuta que funcion
+  |   handlers/      |      Ejecuta la logica del endpoint
+  +------------------+
+       |
+       v
+  +------------------+
+  | applications/    |  <-- Capa 2: Logica de negocio (casos de uso)
+  |   auth/          |      Ejemplo: "Si el password es correcto, crear sesion"
+  |   professor/     |
+  +------------------+
+       |
+       v
+  +------------------+
+  | domains/         |  <-- Capa 3: Reglas del negocio
+  |   auth/          |      Ejemplo: "Un student no puede abrir sesion de asistencia"
+  +------------------+
+       |
+       v
+  +------------------+
+  | infrastructure/  |  <-- Capa 4: Conexion con servicios externos
+  |   database/      |      Ejemplo: "Guardar usuario en PostgreSQL"
+  |   redis/         |      Ejemplo: "Guardar cache en Redis"
+  |   auth/          |      Ejemplo: "Generar token JWT"
+  +------------------+
+       |
+       v
+  PostgreSQL / Redis / Email / Externos
+
+Esta separacion se llama "Clean Architecture" o "Arquitectura Limpia".
+Ventaja: si quieres cambiar PostgreSQL por MySQL, solo cambias la capa
+de infrastructure, sin tocar nada de la logica del negocio.
+
+
+================================================================================
+3. APP.JS - PUNTO DE ENTRADA
+================================================================================
+Ubicacion: backend/src/app.ts
+
+Este es el archivo que arranca todo. Piensa en el como el "interruptor
+principal" de un edificio.
+
+CODIGO COMPLETO CON EXPLICACION:
+
+----------------------------------------------------------------------
+import Fastify from 'fastify';
+----------------------------------------------------------------------
+// Importamos Fastify, el framework HTTP.
+// Fastify es como Express pero mas rapido.
+// Nos permite definir rutas (endpoints) como GET /health, POST /login.
+//
+// Ejemplo: cuando el navegador hace GET /health, Fastify ejecuta
+// la funcion que le correspondsa a esa ruta.
+
+----------------------------------------------------------------------
+import cors from '@fastify/cors';
+----------------------------------------------------------------------
+// CORS (Cross-Origin Resource Sharing).
+// Permite que tu frontend (localhost:3000) haga peticiones a tu
+// backend (localhost:5000) sin que el navegador las bloquee.
+//
+// Sin CORS, el navegador muestra un error como:
+//   "Access to XMLHttpRequest blocked by CORS policy"
+//
+// Es como un seguro de puerta: solo deja entrar a quien tu autorizas.
+
+----------------------------------------------------------------------
+import helmet from '@fastify/helmet';
+----------------------------------------------------------------------
+// Helmet agrega headers de seguridad HTTP automaticamente.
+// Protege contra ataques como XSS, clickjacking, sniffing.
+//
+// Ejemplo: Helmet agrega este header a TODAS las respuestas:
+//   Strict-Transport-Security: max-age=31536000; includeSubDomains
+// Esto le dice al navegador: "nunca use HTTP, solo use HTTPS".
+
+----------------------------------------------------------------------
+import { config } from './infrastructure/config/env.config.js';
+----------------------------------------------------------------------
+// Nuestra configuracion centralizada.
+// Lee las variables de .env y las exporta como un objeto.
+// Ejemplo: config.DB_HOST = "localhost", config.PORT = 5000
+
+----------------------------------------------------------------------
+import { postgresPool } from './infrastructure/database/postgres/postgres.helper.js';
+----------------------------------------------------------------------
+// Pool de conexiones a PostgreSQL.
+// "Pool" = grupo de conexiones reutilizables.
+// Es como un estacionamiento: no creas un auto nuevo cada vez,
+// tomas uno prestado y lo devuelves cuando terminas.
+
+----------------------------------------------------------------------
+import { redisClient } from './infrastructure/redis/redis.helper.js';
+----------------------------------------------------------------------
+// Cliente de Redis. Redis es una base de datos en memoria ultra rapida.
+// La usamos para cache, sesiones, y datos temporales.
+
+----------------------------------------------------------------------
+const app = Fastify({
+  logger: {
+    level: config.NODE_ENV === 'production' ? 'info' : 'debug',
+    transport: config.NODE_ENV !== 'production' ? { target: 'pino-pretty' } : undefined,
+  },
+});
+----------------------------------------------------------------------
+// Creamos la instancia de Fastify con configuracion de logging.
+//
+// logger.level:
+//   - 'info' en produccion (muestra resumenes importantes)
+//   - 'debug' en desarrollo (muestra TODO para depurar)
+//
+// logger.transport:
+//   - pino-pretty formatea los logs para que se vean bonitos
+//   - En produccion no se usa (los logs van a archivos o servicios)
+//
+// Ejemplo de salida con pino-pretty:
+//   [2026-09-12 16:02:54] INFO: PostgreSQL connected
+
+----------------------------------------------------------------------
+await app.register(cors, { origin: config.CORS_ORIGIN.split(',') });
+----------------------------------------------------------------------
+// Registramos CORS.
+// config.CORS_ORIGIN es algo como "http://localhost:3000,http://localhost:5173"
+// El .split(',') lo convierte en array: ["http://localhost:3000", "http://localhost:5173"]
+// Solo esos origenes pueden hacer peticiones a la API.
+
+----------------------------------------------------------------------
+await app.register(helmet);
+----------------------------------------------------------------------
+// Registramos Helmet. Automaticamente agrega headers de seguridad
+// a TODAS las respuestas. No necesitas hacer nada mas.
+
+----------------------------------------------------------------------
+app.get('/health', async () => {
+  return { status: 'ok', timestamp: new Date().toISOString() };
+});
+----------------------------------------------------------------------
+// Endpoint de health check. Es como el "timbre" del servidor.
+//
+// Cuando alguien hace GET /health, responde:
+//   { "status": "ok", "timestamp": "2026-09-12T16:02:54.600Z" }
+//
+// Lo usan:
+//   - Docker para verificar que el contenedor esta saludable
+//   - Monitoreo para saber si el servidor esta caido
+//   - Load balancers para saber a quien enviar trafico
+//
+// Prueba: curl http://localhost:5000/health
+
+----------------------------------------------------------------------
+const start = async () => {
+  try {
+    await postgresPool.query('SELECT 1');
+    app.log.info('PostgreSQL connected');
+----------------------------------------------------------------------
+// Verificamos que PostgreSQL este funcionando.
+// "SELECT 1" es la query mas simple. Solo queremos saber si la
+// conexion funciona. Si falla, PostgreSQL no esta corriendo o los
+// datos de conexion son incorrectos.
+
+----------------------------------------------------------------------
+    await redisClient.ping();
+    app.log.info('Redis connected');
+----------------------------------------------------------------------
+// Verificamos que Redis este funcionando.
+// "PING" es el comando basico de Redis. Le pregunta "estas ahi?"
+// y Redis responde "PONG".
+
+----------------------------------------------------------------------
+    await app.listen({ port: config.PORT, host: '0.0.0.0' });
+    app.log.info(`Server running on http://localhost:${config.PORT}`);
+----------------------------------------------------------------------
+// Abrimos el servidor HTTP.
+// - port: el puerto (por defecto 5000)
+// - host: '0.0.0.0' significa "acepta conexiones de cualquier lugar"
+//   Esto es necesario para Docker, donde el contenedor necesita ser
+//   accesible desde afuera.
+
+----------------------------------------------------------------------
+  } catch (err) {
+    app.log.error(err);
+    process.exit(1);
+  }
+};
+----------------------------------------------------------------------
+// Si CUALQUIER paso falla, registramos el error y cerramos el proceso.
+// process.exit(1) = "algo salio mal, terminar con error".
+// En Docker, esto causa que el contenedor se reinicie automaticamente.
+
+----------------------------------------------------------------------
+start();
+----------------------------------------------------------------------
+// Finalmente, llamamos a start() para ejecutar todo lo de arriba.
+// Es como apretar el boton de "ON" en la maquina.
+
+
+================================================================================
+4. ENV.CONFIG.TS - VARIABLES DE ENTORNO
+================================================================================
+Ubicacion: backend/src/infrastructure/config/env.config.ts
+
+Este archivo lee todas las variables del archivo .env y las exporta
+como un objeto tipado de TypeScript.
+
+¿Por que existe?
+En lugar de usar process.env.DB_HOST en 50 archivos diferentes,
+lo leemos UNA vez aqui y lo usamos en todos lados.
+
+----------------------------------------------------------------------
+import dotenv from 'dotenv';
+----------------------------------------------------------------------
+// dotenv es la libreria que lee el archivo .env y carga las variables
+// en process.env. Sin dotenv, process.env.DB_HOST seria undefined.
+
+----------------------------------------------------------------------
+dotenv.config();
+----------------------------------------------------------------------
+// Ejecuta dotenv. Lee .env en la carpeta raiz del backend y carga
+// todas las variables en process.env.
+// Ejemplo: si .env tiene "DB_HOST=localhost", despues de esta linea,
+// process.env.DB_HOST sera "localhost".
+
+----------------------------------------------------------------------
+export const config = {
+----------------------------------------------------------------------
+// Exportamos un objeto con todas las variables. Cada una tiene un
+// "fallback" (valor por defecto) por si falta en .env.
+
+----------------------------------------------------------------------
+  PORT: parseInt(process.env.PORT || '5000', 10),
+----------------------------------------------------------------------
+// Puerto del servidor HTTP. parseInt convierte string a number.
+// El "10" es la base decimal. Ejemplo: http://localhost:5000/health
+
+----------------------------------------------------------------------
+  NODE_ENV: process.env.NODE_ENV || 'development',
+----------------------------------------------------------------------
+// Entorno: "development" (local) o "production" (en vivo).
+
+----------------------------------------------------------------------
+  DB_HOST: process.env.DB_HOST || 'localhost',
+----------------------------------------------------------------------
+// Donde esta PostgreSQL. En Docker es "postgres" (el nombre del servicio).
+
+----------------------------------------------------------------------
+  DB_PORT: parseInt(process.env.DB_PORT || '5432', 10),
+----------------------------------------------------------------------
+// Puerto de PostgreSQL. Por defecto 5432.
+
+----------------------------------------------------------------------
+  DB_USER: process.env.DB_USER || 'attendgo',
+----------------------------------------------------------------------
+// Usuario de PostgreSQL.
+
+----------------------------------------------------------------------
+  DB_PASSWORD: process.env.DB_PASSWORD || '',
+----------------------------------------------------------------------
+// Password de PostgreSQL. SECRETO, nunca hardcodeado.
+
+----------------------------------------------------------------------
+  DB_NAME: process.env.DB_NAME || 'attendgo',
+----------------------------------------------------------------------
+// Nombre de la base de datos.
+
+----------------------------------------------------------------------
+  REDIS_HOST: process.env.REDIS_HOST || 'localhost',
+----------------------------------------------------------------------
+// Donde esta Redis. En Docker es "redis".
+
+----------------------------------------------------------------------
+  REDIS_PORT: parseInt(process.env.REDIS_PORT || '6379', 10),
+----------------------------------------------------------------------
+// Puerto de Redis. Por defecto 6379.
+
+----------------------------------------------------------------------
+  JWT_SECRET: process.env.JWT_SECRET || '',
+----------------------------------------------------------------------
+// La "llave maestra" para firmar tokens JWT.
+// Si alguien la obtiene, puede crear tokens falsos.
+// Generar con: openssl rand -base64 32
+
+----------------------------------------------------------------------
+  JWT_EXPIRES_IN: process.env.JWT_EXPIRES_IN || '30m',
+----------------------------------------------------------------------
+// Cuanto tiempo vive un token JWT. "30m" = 30 minutos.
+// Otros valores: "1h", "7d", "365d".
+
+----------------------------------------------------------------------
+  CORS_ORIGIN: process.env.CORS_ORIGIN || 'http://localhost:3000',
+----------------------------------------------------------------------
+// Que dominios pueden conectarse. Separados por coma.
+
+
+================================================================================
+5. POSTGRES.HELPER.TS - CONEXION A POSTGRESQL
+================================================================================
+Ubicacion: backend/src/infrastructure/database/postgres/postgres.helper.ts
+
+Este archivo crea un "pool de conexiones" a PostgreSQL.
+
+¿Que es un pool?
+Imagina un restaurante con mesas (conexiones). En lugar de crear una mesa
+nueva para cada cliente y destruirla cuando se va, tienes un conjunto fijo
+de mesas listas. Cuando llega un cliente, le das una ocupada. Cuando se va,
+la liberas para el siguiente.
+
+----------------------------------------------------------------------
+import pg from 'pg';
+----------------------------------------------------------------------
+// pg es la libreria oficial de Node.js para conectarse a PostgreSQL.
+// Es como el "chofer" que lleva tus queries a la BD y trae respuestas.
+
+----------------------------------------------------------------------
+import { config } from '../../config/env.config.js';
+----------------------------------------------------------------------
+// Importamos la configuracion para obtener host, puerto, usuario, etc.
+
+----------------------------------------------------------------------
+export const postgresPool = new pg.Pool({
+----------------------------------------------------------------------
+// Creamos el pool. pg.Pool es como un "gerente de mesas".
+
+----------------------------------------------------------------------
+  host: config.DB_HOST,
+----------------------------------------------------------------------
+// Donde esta el servidor. "localhost" en dev, "postgres" en Docker.
+
+----------------------------------------------------------------------
+  port: config.DB_PORT,
+----------------------------------------------------------------------
+// Puerto. 5432 es el estandar de PostgreSQL.
+
+----------------------------------------------------------------------
+  user: config.DB_USER,
+----------------------------------------------------------------------
+// Usuario para autenticarse.
+
+----------------------------------------------------------------------
+  password: config.DB_PASSWORD,
+----------------------------------------------------------------------
+// Password del usuario.
+
+----------------------------------------------------------------------
+  database: config.DB_NAME,
+----------------------------------------------------------------------
+// Que base de datos usar.
+
+----------------------------------------------------------------------
+  max: 20,
+----------------------------------------------------------------------
+// Maximo de conexiones simultaneas. 20 es razonable para app mediana.
+// Regla: (CPU cores * 2) + 1. Para 4 cores = 9. 20 es seguro.
+
+----------------------------------------------------------------------
+  idleTimeoutMillis: 30000,
+----------------------------------------------------------------------
+// Si una conexion esta sin usar 30 segundos, se cierra.
+// Libera recursos del servidor PostgreSQL.
+
+----------------------------------------------------------------------
+  connectionTimeoutMillis: 2000,
+----------------------------------------------------------------------
+// Si no conecta en 2 segundos, devuelve error.
+// Evita que la app se quede colgada esperando.
+
+----------------------------------------------------------------------
+});
+----------------------------------------------------------------------
+
+COMO USARLO EN OTROS ARCHIVOS:
+
+  // Query simple
+  const result = await postgresPool.query('SELECT * FROM users');
+  console.log(result.rows); // Array de usuarios
+
+  // Query con parametros (SEGURO contra SQL injection)
+  const result = await postgresPool.query(
+    'SELECT * FROM users WHERE email = $1',
+    ['usuario@correo.com']
+  );
+
+  // Insertar datos
+  await postgresPool.query(
+    'INSERT INTO users (email, password, role) VALUES ($1, $2, $3)',
+    ['email@correo.com', 'password_hash', 'student']
+  );
+
+  // Transaccion (varios cambios atomicos)
+  const client = await postgresPool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('INSERT INTO users ...');
+    await client.query('UPDATE students ...');
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release(); // SIEMPRE devolver la conexion al pool
+  }
+
+IMPORTANTE: Usa SIEMPRE $1, $2, $3 para parametros.
+  MAL:    `SELECT * FROM users WHERE email = '${email}'`  (SQL INJECTION!)
+  BIEN:   `SELECT * FROM users WHERE email = $1`, [email]  (SEGURO)
+
+
+================================================================================
+6. REDIS.HELPER.TS - CLIENTE REDIS
+================================================================================
+Ubicacion: backend/src/infrastructure/redis/redis.helper.ts
+
+Este archivo crea un cliente de Redis.
+
+¿Que es Redis?
+Redis es una base de datos en memoria ultra rapida. Es como una pizarra
+blanca: escribe y lee instantaneamente. PostgreSQL es como un archivador:
+muy organizado pero mas lento.
+
+Para que usamos Redis?
+- Cache de datos frecuentes (perfil de usuario, configuracion)
+- Rate limiting (limitar peticiones por usuario)
+- Colas de mensajes
+- Sesion de usuario (datos temporales del login)
+
+----------------------------------------------------------------------
+import { Redis } from 'ioredis';
+----------------------------------------------------------------------
+// ioredis es la libreria para conectar a Redis.
+// NOTA: En v6, Redis se importa como NAMED export, no default.
+//   import { Redis } from 'ioredis';  // Correcto en v6
+//   import Redis from 'ioredis';       // Error en v6
+
+----------------------------------------------------------------------
+import { config } from '../config/env.config.js';
+----------------------------------------------------------------------
+// Importamos host y puerto de la configuracion.
+
+----------------------------------------------------------------------
+export const redisClient = new Redis({
+----------------------------------------------------------------------
+// Creamos la instancia del cliente Redis.
+
+----------------------------------------------------------------------
+  host: config.REDIS_HOST,
+----------------------------------------------------------------------
+// Donde esta Redis. "localhost" en dev, "redis" en Docker.
+
+----------------------------------------------------------------------
+  port: config.REDIS_PORT,
+----------------------------------------------------------------------
+// Puerto de Redis. 6379 es el estandar.
+
+----------------------------------------------------------------------
+  maxRetriesPerRequest: 3,
+----------------------------------------------------------------------
+// Cuantas veces reintentar si falla una peticion.
+// 3 es razonable. Si pones 0, no reintenta. Si pones mucho,
+// la peticion se queda colgada mucho tiempo.
+
+----------------------------------------------------------------------
+  lazyConnect: true,
+----------------------------------------------------------------------
+// "No te conectes ahora, espera a que alguien te pida algo."
+// Es como un mesero que espera en la cocina hasta que un cliente pide.
+//
+// Si lazyConnect = false, Redis intenta conectarse INMEDIATAMENTE.
+// Si Redis no esta listo, la app crashea.
+// Con lazyConnect = true, la app arranca y Redis se conecta cuando
+// se necesite (en el primer comando).
+//
+// En app.ts hacemos redisClient.ping() para verificar antes de abrir,
+// asi que lazyConnect es seguro.
+
+----------------------------------------------------------------------
+});
+----------------------------------------------------------------------
+
+COMO USARLO EN OTROS ARCHIVOS:
+
+  // Guardar con expiracion (cache por 1 hora)
+  await redisClient.set('user:123', JSON.stringify(userData), 'EX', 3600);
+
+  // Leer
+  const data = await redisClient.get('user:123');
+  if (data) {
+    const user = JSON.parse(data);
+  }
+
+  // Eliminar
+  await redisClient.del('user:123');
+
+  // Verificar si existe
+  const exists = await redisClient.exists('user:123'); // 1 o 0
+
+  // Rate limiting (max 100 peticiones por minuto)
+  const key = `rate:${userId}`;
+  const count = await redisClient.incr(key);
+  if (count === 1) {
+    await redisClient.expire(key, 60);
+  }
+  if (count > 100) {
+    throw new Error('Demasiadas peticiones');
+  }
+
+
+================================================================================
+7. LOGGER.TS - SISTEMA DE LOGS
+================================================================================
+Ubicacion: backend/src/shared/logger/logger.ts
+
+Este archivo crea un logger que puede usar cualquier archivo del proyecto.
+
+¿Que es un logger?
+Un logger es como un periodico del servidor: registra todo lo que pasa
+con timestamps y niveles de severidad.
+
+Ejemplo de salida:
+  [2026-09-12 16:02:54] INFO: PostgreSQL connected
+  [2026-09-12 16:02:54] DEBUG: Query ejecutada en 15ms
+  [2026-09-12 16:02:55] ERROR: Connection refused
+
+¿Por que Pino y no console.log?
+- Pino es 5-10x mas rapido
+- Agrega timestamps automaticamente
+- Tiene niveles (debug, info, warn, error)
+- Puede enviar logs a servicios externos (Datadog, etc.)
+
+----------------------------------------------------------------------
+import pino from 'pino';
+----------------------------------------------------------------------
+// pino es la libreria de logging. Rapida, estructurada, consistente.
+
+----------------------------------------------------------------------
+import { config } from '../../infrastructure/config/env.config.js';
+----------------------------------------------------------------------
+// Para saber en que entorno estamos (development o production).
+
+----------------------------------------------------------------------
+export const logger = pino({
+----------------------------------------------------------------------
+// Creamos la instancia del logger.
+
+----------------------------------------------------------------------
+  level: config.NODE_ENV === 'production' ? 'info' : 'debug',
+----------------------------------------------------------------------
+// Niveles de severidad (de menor a mayor):
+//   trace -> debug -> info -> warn -> error -> fatal
+//
+// 'debug' = registra TODO (para depurar en desarrollo)
+// 'info' = solo lo importante (para no llenar el disco en produccion)
+
+----------------------------------------------------------------------
+  transport: config.NODE_ENV !== 'production' ? { target: 'pino-pretty' } : undefined,
+----------------------------------------------------------------------
+// pino-pretty formatea los logs para que se vean bonitos.
+// Sin pino-pretty: {"level":30,"time":1694539374000,"msg":"Connected"}
+// Con pino-pretty: [2026-09-12 16:02:54] INFO: Connected
+//
+// En produccion no se usa porque los logs van a archivos JSON.
+
+----------------------------------------------------------------------
+});
+----------------------------------------------------------------------
+
+COMO USARLO:
+
+  import { logger } from '../shared/logger/logger.js';
+
+  // Mensaje simple
+  logger.info('Servidor iniciado');
+
+  // Mensaje con datos
+  logger.info({ userId: '123', action: 'login' }, 'Usuario ha iniciado sesion');
+
+  // Error con stack trace
+  try {
+    await someOperation();
+  } catch (err) {
+    logger.error({ err }, 'Error al ejecutar operacion');
+  }
+
+  // Debug (solo se ve en desarrollo)
+  logger.debug({ query: 'SELECT * FROM users', duration: '15ms' }, 'Query ejecutada');
+
+  // Warning
+  logger.warn({ retryCount: 3 }, 'Maximo de reintentos alcanzado');
+
+NOTA: Este logger es standalone (fuera de Fastify).
+Dentro de Fastify usa app.log.info() que incluye info del request.
+
+
+================================================================================
+8. AUTH.ENUMS.TS - ENUMERACIONES
+================================================================================
+Ubicacion: backend/src/domains/auth/auth.enums.ts
+
+Los enums son listas de valores permitidos. Es como un menu de restaurante:
+solo puedes pedir lo que esta en la carta.
+
+¿Por que usar enums en vez de strings sueltos?
+- Si escribes "admin" en vez de "admin_general", TypeScript no te avisa
+- Si usas Role.ADMIN_GENERAL, TypeScript te marca error si te equivocas
+- Autocompletado: tu editor te muestra las opciones disponibles
+
+----------------------------------------------------------------------
+export enum Role {
+----------------------------------------------------------------------
+// Cada usuario tiene UN solo rol. El rol determina que puede hacer.
+// Es como un nivel de acceso en un edificio.
+
+  ADMIN_GENERAL = 'admin_general',
+  // Super administrador: gestiona TODO el sistema.
+  // Puede crear instituciones, usuarios, ver reportes globales.
+
+  ADMIN_EDUCATION_ENTITY = 'admin_education_entity',
+  // Administrador de una institucion. Solo gestiona SU institucion.
+  // Ejemplo: el director de una escuela.
+
+  PROFESSOR = 'professor',
+  // Profesor: crea sesiones de asistencia, gestiona sus clases.
+  // Puede ver asistencia de sus estudiantes y generar QR.
+
+  STUDENT = 'student',
+  // Estudiante: marca asistencia, ve su historial.
+  // Puede escanear QR y registrar datos biometricos.
+}
+
+----------------------------------------------------------------------
+export enum DayWeek {
+----------------------------------------------------------------------
+// Dias de la semana. Usado en la tabla Classes para definir que dia
+// se imparte una clase. Los valores en ingles coinciden con la DB.
+
+  MONDAY = 'Monday',
+  TUESDAY = 'Tuesday',
+  WEDNESDAY = 'Wednesday',
+  THURSDAY = 'Thursday',
+  FRIDAY = 'Friday',
+  SATURDAY = 'Saturday',
+  SUNDAY = 'Sunday',
+}
+
+----------------------------------------------------------------------
+export enum AssistanceMethod {
+----------------------------------------------------------------------
+// Metodos de asistencia. Cada uno tiene diferente nivel de seguridad.
+
+  QR = 'QR',
+  // Codigo QR dinamico. El profesor genera un QR que cambia cada
+  // 30 segundos. El estudiante lo escanea y listo.
+
+  QR_BIOMETRIC = 'QR_BIOMETRIC',
+  // QR + huella digital. El estudiante escanea y luego confirma
+  // con su huella. Mas seguro pero requiere lector de huellas.
+
+  MANUAL = 'MANUAL',
+  // Registro manual. El profesor marca quien asistio sin usar
+  // QR ni biometria. Para clases donde no hay tecnologia.
+}
+
+----------------------------------------------------------------------
+export enum AttendanceStatus {
+----------------------------------------------------------------------
+// Estados de asistencia de un estudiante.
+
+  ATTENDED = 'attended',
+  // El estudiante asistio a la clase.
+
+  NO_ATTENDED = 'no_attended',
+  // No asistio sin justificacion. Se marca como "falta".
+
+  NO_ATTENDED_EXCUSE = 'no_attended_excuse',
+  // No asistio PERO tiene justificacion (certificado medico, etc.).
+}
+
+
+================================================================================
+9. CAPA DE DOMINIO - ENTIDADES Y VALUE OBJECTS
+================================================================================
+Ubicacion: backend/src/domains/
+
+La capa de dominio contiene las entidades (interfaces) que representan
+las tablas de la base de datos y los objetos que viajan entre capas.
+
+¿Que es una entidad?
+Una entidad es la representacion de un objeto del negocio. Por ejemplo,
+un "Usuario" es una entidad: tiene nombre, email, password, rol, etc.
+
+¿Que es un DTO?
+DTO = Data Transfer Object. Es un objeto que se envia entre capas.
+Por ejemplo, al crear un usuario, el frontend envia un DTO con email,
+password y role. El backend lo transforma en una entidad completa
+agregando id, timestamps, etc.
+
+¿Que es un Value Object?
+Un value object es un valor con reglas de validacion. Por ejemplo,
+un password no puede tener menos de 8 caracteres. Esas reglas van
+en un value object, no en la entidad.
+
+ESTRUCTURA DE ARCHIVOS:
+
+  domains/
+  ├── auth/
+  │   ├── auth.enums.ts           # Enums: Role, DayWeek, AssistanceMethod, AttendanceStatus
+  │   └── auth.value-objects.ts   # Validaciones: password, email
+  ├── user/
+  │   └── user.entity.ts          # Interfaz User, CreateUserDTO, UserResponse
+  ├── institution/
+  │   └── institution.entity.ts   # Interfaz EducationEntity, DTOs, Filters
+  ├── admin-general/
+  │   └── admin-general.entity.ts # Interfaz AdminGeneral, CreateAdminGeneralDTO
+  ├── admin-entidad/
+  │   └── admin-entidad.entity.ts # Interfaz AdminEducationEntity, DTOs
+  ├── professor/
+  │   └── professor.entity.ts     # Interfaz Professor, DTOs, Filters
+  ├── class/
+  │   └── class.entity.ts         # Interfaz Class, DTOs, Filters (usa DayWeek enum)
+  ├── student/
+  │   ├── student.entity.ts       # Interfaz Student, DTOs, Filters
+  │   └── student-class.entity.ts # Interfaz StudentClass, EnrollStudentDTO
+  ├── biometric/
+  │   └── biometric.entity.ts     # Interfaz StudentBiometric (huellas digitales)
+  ├── attendance/
+  │   ├── attendance.entity.ts    # Interfaz Assistance (sesion de asistencia)
+  │   └── attendance-detail.entity.ts # Interfaz AttendanceDetail + DTOs de registro
+  ├── session/
+  │   └── session.entity.ts       # Interfaz Session (sesiones activas multi-dispositivo)
+  ├── token-recovery/
+  │   └── token-recovery.entity.ts # Interfaz TokenRecuperacion de password
+  ├── terms/
+  │   └── terms.entity.ts         # Interfaz TermsAndConditions
+  └── error/
+      └── error-log.entity.ts     # Interfaz ErrorLog (log de errores)
+
+ARCHIVOS CLAVE CON EXPLICACION:
+
+----------------------------------------------------------------------
+auth.value-objects.ts
+----------------------------------------------------------------------
+Valida la fortaleza de passwords y formato de email.
+
+  PasswordV0:              Interface basica de value object para passwords.
+  validatePasswordStrength(): Verifica minimo 8 caracteres, 1 mayuscula,
+                              1 numero, 1 simbolo. Retorna { valid, errors[] }.
+  validateEmail():         Valida formato de email con regex.
+
+  Ejemplo:
+    const result = validatePasswordStrength("Abcdefg!1");
+    // { valid: true, errors: [] }
+
+    const result = validatePasswordStrength("abc");
+    // { valid: false, errors: ["Minimo 8 caracteres", "Al menos 1 mayuscula", ...] }
+
+----------------------------------------------------------------------
+user.entity.ts
+----------------------------------------------------------------------
+Modelo central de usuarios (todos los roles comparten esta tabla).
+
+  User:             Estructura completa con 13 campos (id, email, password,
+                    role como enum Role, tokenVersion, isActive, etc.)
+  CreateUserDTO:    Objeto para registro (email, password, role).
+  UserResponse:     Respuesta al cliente SIN campos sensibles (sin password).
+
+  Nota: tokenVersion se incrementa al cambiar password para invalidar JWTs.
+
+----------------------------------------------------------------------
+institution.entity.ts
+----------------------------------------------------------------------
+Modelo de instituciones educativas.
+
+  EducationEntity:            Estructura completa (name, country, city, etc.)
+  CreateEducationEntityDTO:   Para crear (sin id ni timestamps).
+  UpdatedEducationEntityDTO:  Para actualizar (todos opcionales).
+  EducationEntityFilters:     Filtros de busqueda (country, city, search).
+
+----------------------------------------------------------------------
+admin-general.entity.ts
+----------------------------------------------------------------------
+Modelo de super administrador (global, sin institucion asignada).
+
+  AdminGeneral:               Estructura completa (userId, name, phone).
+  CreateAdminGeneralDTO:      Para crear (sin id ni timestamps).
+
+  Nota: NO tiene educationEntityId porque gestiona TODAS las instituciones.
+
+----------------------------------------------------------------------
+admin-entidad.entity.ts
+----------------------------------------------------------------------
+Modelo de administrador de una institucion especifica.
+
+  AdminEducationEntity:                Estructura completa con educationEntityId.
+  CreateAdminEducationEntityDTO:       Para crear con educationEntityId obligatorio.
+
+  Nota: SI tiene educationEntityId porque solo gestiona SU institucion.
+
+----------------------------------------------------------------------
+professor.entity.ts
+----------------------------------------------------------------------
+Modelo de profesores.
+
+  Professor:            Estructura completa con educationalDepartment.
+  CreateProfessorDTO:   Para crear con todos los campos obligatorios.
+  updatedProfessorDTO:  Para actualizar (name, phone, department).
+  ProfessorFilters:     Filtros (educationEntityId, search).
+
+  Nota: educationalDepartment indica el area academica (ej: "Matematicas").
+
+----------------------------------------------------------------------
+class.entity.ts
+----------------------------------------------------------------------
+Modelo de clases programadas (un slot semanal recurrente).
+
+  Class:             Usa el enum DayWeek para classDay.
+  CreateClassDTO:    Todos los campos obligatorios.
+  UpdateClassDTO:    Solo campos editables (name, schedule, classroom).
+  ClassFilters:      Filtros (educationEntityId, classDay, search).
+
+  Nota: startTime y endTime son strings tipo "08:00", "10:00".
+
+----------------------------------------------------------------------
+student.entity.ts
+----------------------------------------------------------------------
+Modelo de estudiantes.
+
+  Student:           Estructura completa con educationalProgram e identificationNumber.
+  CreateStudentDTO:  Para crear.
+  UpdateStudentDTO:  Solo name, phone, educationalProgram.
+  StudentFilters:    Filtros (educationEntityId, educationalProgram, search).
+
+----------------------------------------------------------------------
+student-class.entity.ts
+----------------------------------------------------------------------
+Relacion many-to-many estudiante-clase (tabla Students_Classes).
+
+  StudentClass:        Registro de inscripcion (studentsId, classId, addedAt).
+  EnrollStudentDTO:    Permite inscribir UN estudiante en MULTIPLES clases
+                       de una vez (classId es un string[]).
+
+  Ejemplo:
+    { studentId: "abc-123", classId: ["class-1", "class-2", "class-3"] }
+
+----------------------------------------------------------------------
+biometric.entity.ts
+----------------------------------------------------------------------
+Registro de huellas digitales.
+
+  StudentBiometric:    studentId, templateData (Buffer/BYTEA), deviceInfo.
+
+  Nota: templateData es un template criptografico, NO una imagen.
+        Se registra desde un lector fisico, no desde la web.
+
+----------------------------------------------------------------------
+attendance.entity.ts
+----------------------------------------------------------------------
+Sesion de asistencia abierta por un profesor.
+
+  Assistance:           Usa enum AssistanceMethod (QR, QR_BIOMETRIC, MANUAL).
+  CreatedAssistance:    Para abrir sesion (sin endTime, se asigna null).
+
+  Nota: endTime es null mientras la sesion esta abierta.
+
+----------------------------------------------------------------------
+attendance-detail.entity.ts
+----------------------------------------------------------------------
+Registro individual de cada estudiante en una sesion.
+
+  AttendanceDetail:           15 campos incluyendo geolocation, macAddress,
+                              biometricVerified, possibleImpersonation.
+  RegisterQRAttendanceDTO:    Para escanear QR (assistanceId, geolocation, MAC).
+  RegisterManualAttendanceDTO: Para asistencia manual con array de registros.
+
+  Ejemplo de RegisterManualAttendanceDTO:
+    {
+      classId: "class-1",
+      records: [
+        { studentsId: "stu-1", state: "attended" },
+        { studentsId: "stu-2", state: "no_attended" }
+      ]
+    }
+
+----------------------------------------------------------------------
+session.entity.ts
+----------------------------------------------------------------------
+Sesiones activas de usuarios (multi-dispositivo).
+
+  Session:    userId, tokenHash, ipAddress, userAgent, expiresAt.
+
+  Nota: tokenHash es el hash SHA-256 del JWT, NO el token literal.
+        Permite tener sesiones activas en multiples dispositivos.
+
+----------------------------------------------------------------------
+token-recovery.entity.ts
+----------------------------------------------------------------------
+Tokens de recuperacion de password.
+
+  TokenRecovery:    userId, code (6 digitos), expiresAt, used.
+
+  Flujo: solicitar -> enviar codigo por email -> verificar -> reset password.
+
+----------------------------------------------------------------------
+terms.entity.ts
+----------------------------------------------------------------------
+Registro de aceptacion de terminos y condiciones.
+
+  TermsAndConditions:    userId (UNIQUE), version, accepted.
+
+  Nota: userId es UNIQUE en la BD, un usuario solo tiene un registro.
+        Se actualiza cuando cambia la version de los terminos.
+
+----------------------------------------------------------------------
+error-log.entity.ts
+----------------------------------------------------------------------
+Log de errores de la aplicacion.
+
+  ErrorLog:    userId (nullable), action, errorMessage, ipAddress, userAgent.
+
+  Nota: Se registra automaticamente desde un middleware global.
+        userId es nullable porque el error puede ocurrir antes del login.
+
+----------------------------------------------------------------------
+ERRORES COMUNES EN LA CAPA DE DOMINIO
+----------------------------------------------------------------------
+
+ERROR: "Cannot find name 'Role'" en user.entity.ts
+  Causa: Usar export { Role } from '...' no crea referencia local.
+  Solucion: Cambiar a import { Role } + export { Role }.
+
+ERROR: Typo en nombres de campos
+  Campos con typos conocidos:
+  - educationalDepartment en professor.entity.ts (falta la 'a' despues de 'edu')
+  - identificationNumber en student.entity.ts (typos intercambiados)
+  - starTime en class.entity.ts (falta la 't')
+  - deciveInfo en biometric.entity.ts (deberia ser deviceInfo)
+  - ipAddrress en session.entity.ts (doble 's')
+  - RegisterManuealAttendanceDTO en attendance-detail.entity.ts (deberia ser Manual)
+
+  IMPORTANTE: Si estos nombres no coinciden con la tabla SQL, las queries fallaran.
+
+
+================================================================================
+10. DOCKER-COMPOSE.YML - INFRAESTRUCTURA DOCKER
+================================================================================
+Ubicacion: docker-compose.yml (raiz del proyecto)
+
+Docker Compose levanta 3 servicios automaticamente:
+
+  +------------------+     +------------------+     +------------------+
+  |   attendgo-db    |     |  attendgo-redis  |     | attendgo-backend |
+  |  PostgreSQL 16   |     |    Redis 7       |     |   Fastify API    |
+  |   Puerto 5432    |     |   Puerto 6379    |     |   Puerto 5000    |
+  +------------------+     +------------------+     +------------------+
+           |                       |                       |
+           +------- attendgo-net (red Docker) -------------+
+
+  postgres:
+    image: postgres:16-alpine        # Imagen oficial de PostgreSQL 16
+    environment:
+      POSTGRES_USER: ${DB_USER}      # Usuario de la BD
+      POSTGRES_PASSWORD: ${DB_PASSWORD}  # Password (SECRETO)
+      POSTGRES_DB: ${DB_NAME}        # Nombre de la BD
+      TZ: America/Bogota             # Zona horaria
+    ports:
+      - "5432:5432"                  # Mapea puerto del contenedor al host
+    volumes:
+      - postgres_data:/var/lib/postgresql/data  # Persiste datos
+
+  redis:
+    image: redis:7-alpine            # Imagen oficial de Redis 7
+    command: redis-server --appendonly yes --maxmemory 256mb
+    # --appendonly yes: guarda datos en disco (no solo en RAM)
+    # --maxmemory 256mb: limite de 256MB de memoria
+    # --maxmemory-policy allkeys-lru: borra datos viejos si se llena
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  backend:
+    build:
+      context: ./backend             # Build desde la carpeta backend
+      dockerfile: Dockerfile         # Usa el Dockerfile de desarrollo
+    environment:
+      DB_HOST: postgres              # Nombre del servicio Docker
+      DB_PORT: 5432
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      REDIS_HOST: redis              # Nombre del servicio Docker
+      REDIS_PORT: 6379
+      JWT_SECRET: ${JWT_SECRET}
+      ...
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres: { condition: service_healthy }  # Espera a que PostgreSQL este listo
+      redis: { condition: service_healthy }     # Espera a que Redis este listo
+    volumes:
+      - ./backend:/app               # Monta el codigo fuente
+      - /app/node_modules            # Excluye node_modules (usa el del contenedor)
+
+COMANDOS UTILES:
+
+  docker compose up -d --build    # Levantar todo
+  docker compose down             # Detener
+  docker compose down -v          # Detener y eliminar volumes (borra datos)
+  docker compose ps               # Ver estado
+  docker compose logs backend     # Ver logs del backend
+  docker compose exec backend sh  # Shell dentro del contenedor backend
+  docker compose exec postgres psql -U attendgo -d attendgo  # Entrar a PostgreSQL
+
+
+================================================================================
+11. MIGRACIONES SQL - BASE DE DATOS
+================================================================================
+Ubicacion: backend/migrations/
+
+Las migraciones son scripts SQL que crean la estructura de la base de datos.
+Es como los planos de un edificio: primero defines las paredes antes de
+amueblar.
+
+ARCHIVO: 001_initial.sql (15 tablas)
+ARCHIVO: 002_indexes.sql (43 indices)
+
+TABLAS PRINCIPALES:
+
+  Users (Usuarios)
+  - Todos los roles comparten esta tabla
+  - email: unico, para login
+  - password: hasheado con bcrypt (nunca el password real)
+  - role: admin_general, admin_education_entity, professor, student
+  - token_version: para revocar JWT (si cambias password, el token viejo se invalida)
+
+  Education_entities (Instituciones)
+  - Escuelas, universidades, colegios
+  - name, country, city, address, phone, email
+
+  Admin_general (Super admin)
+  - Solo tiene: user_id, name, phone
+  - Referencia a Users
+
+  admin_education_entity (Admin de institucion)
+  - user_id + education_entity_id
+  - Administra una institucion especifica
+
+  Professors (Profesores)
+  - user_id + education_entity_id
+  - educational_department: departamento academico
+
+  Classes (Clases)
+  - education_entity_id + professor_id
+  - class_day: dia de la semana (Monday, Tuesday, etc.)
+  - start_time, end_time: hora de la clase
+  - classroom: aula donde se imparte
+
+  Students (Estudiantes)
+  - user_id + education_entity_id
+  - identification_number: numero de cedula o carnet
+
+  Students_Classes (Inscripcion)
+  - Relacion many-to-many: un estudiante puede estar en muchas clases
+  - UNIQUE(students_id, class_id): no se puede inscribir dos veces
+
+  student_biometrics (Datos biometricos)
+  - template_data: plantilla de huella digital (en formato BYTEA)
+  - device_info: informacion del dispositivo que registro la huella
+
+  Assistance (Sesion de asistencia)
+  - class_id + professor_id + date_assistance + method
+  - El profesor abre una sesion, y los estudiantes marcan asistencia
+
+  Attendance_details (Detalle de asistencia)
+  - assistance_id + students_id
+  - state_attendance: attended, no_attended, no_attended_excuse
+  - mac_address: direccion MAC del dispositivo del estudiante
+  - geolocation_lat, geolocation_lng: ubicacion GPS
+  - biometric_verified: si paso la verificacion biométrica
+  - possible_impersonation: si se detecto suplantacion
+
+  Tokens_recovery (Recuperacion de password)
+  - user_id + code (6 digitos) + expires_at
+  - Codigo que se envia por email para restablecer password
+
+  Sessions (Sesiones activas)
+  - user_id + token_hash + ip_address + user_agent
+  - Para gestionar multiples dispositivos
+
+  Error_logs (Log de errores)
+  - user_id + action + error_message
+  - Registro de errores de la aplicacion
+
+EJECUTAR MIGRACIONES:
+
+  docker compose exec postgres psql -U attendgo -d attendgo \
+    -f /dev/stdin < backend/migrations/001_initial.sql
+
+  docker compose exec postgres psql -U attendgo -d attendgo \
+    -f /dev/stdin < backend/migrations/002_indexes.sql
+
+VERIFICAR:
+
+  docker compose exec postgres psql -U attendgo -d attendgo -c "\dt"
+
+
+================================================================================
+12. ERRORES COMUNES Y SOLUCIONES
+================================================================================
+
+ERROR: ERR_PNPM_IGNORED_BUILDS
+  Mensaje: "Ignored build scripts: esbuild@0.28.2"
+  Causa: pnpm v10+ bloquea scripts de build por defecto.
+  Solucion: En Dockerfile, cambiar:
+    RUN pnpm install
+  por:
+    RUN pnpm approve-builds esbuild && pnpm install
+
+ERROR: logger options only accepts a configuration object
+  Causa: Fastify 5 no acepta instancia de pino, solo objeto de config.
+  Solucion: En app.ts:
+    const app = Fastify({
+      logger: { level: 'info', transport: { target: 'pino-pretty' } }
+    });
+    // Usar app.log.info() en lugar de logger.info()
+
+ERROR: This expression is not constructable (ioredis)
+  Causa: En ioredis v6, Redis ya no es export default.
+  Solucion: Cambiar:
+    import Redis from 'ioredis';   // MAL en v6
+  por:
+    import { Redis } from 'ioredis';  // BIEN en v6
+
+ERROR: DB_PASSWORD is required
+  Causa: .env tiene DB_PASSWORD=vacio, pero docker-compose lo requiere.
+  Solucion: Asignar valor real en .env:
+    DB_PASSWORD=$(openssl rand -base64 24)
+
+ERROR: pnpm-lock.yaml no se sube a git
+  Causa: Estaba en .gitignore.
+  Solucion: Eliminar pnpm-lock.yaml de .gitignore.
+  Razon: El lock file DEBE subirse para instalaciones reproducibles.
+
+
+================================================================================
+                              FIN DE LA GUIA
+================================================================================
